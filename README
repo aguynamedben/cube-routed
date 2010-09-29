@@ -1,0 +1,79 @@
+
+This archive includes cube-routed, a dynamic routing daemon for VcubeV.
+For more details, please visit http://www.cohesiveft.com/developer/
+
+cube-routed is available under Common Public Attribution License
+Version 1.0 (CPAL) - please refer to LICENSE.txt (included in this archive)
+for the full text of the license. Parts of the script are available
+under modified BSD license - please refer to the source code.
+
+REQUIREMENTS
+- Linux operating system
+- Configured OpenVPN server, with management interface enabled
+- Python 2.4 or later
+
+INSTALLATION
+- Copy cube-routed to a directory of your choice (for example,
+    /usr/local/sbin)
+- Adjust the first line of the script ("shebang" line) to point to
+    location of Python 2.4 or later on your system
+
+CONFIGURATION
+- Create cube-routed confguration file in a directory of your choice
+    (e.g., /etc) and give it a name of your choice (e.g., cube1.conf)
+	with the following contents:
+
+=== /etc/cube1.conf starts here ===
+mgmt_interface = tun1
+data_interface = tun0
+remote_mgmt_ip = 10.200.200.5
+remote_data_ip = 10.100.100.101
+openvpn_mgmt_pass_file = /etc/openvpn/pass
+openvpn_mgmt_port = 5656
+cube_routed_port = 5657
+=== /etc/cube1.conf ends here ===
+
+- Adjust values of each parameter as follows:
+  mgmt_interface - OpenVPN network interface that corresponds to
+                   VcubeV management subnet (if not sure, use tun1)
+  data_interface - OpenVPN network interface that corresponds to
+                   VcubeV data subnet (if not sure, use tun0)
+  remote_mgmt_ip - IP address of remote cube-routed instance
+                   on management subnet
+  remote_data_ip - IP address of remote cube-routed instance
+                   on data subnet
+  openvpn_mgmt_pass_file - path to OpenVPN management password file
+                   based on OpenVPN configuration ("management" command)
+                   (e.g.: management tunnel 5656 /etc/openvpn/pass)
+  openvpn_mgmt_port - local TCP port of the management interface of _data_ (!)
+                   OpenVPN server (the one which provides data_interface)
+  cube_routed_port - TCP port on which cube-routed must listen
+                   for requests (must be the same on both cube-routed
+				   instances)
+
+- Note that remote cube-routed instance will usually have an identical
+    configuration file, except remote_mgmt_ip and remote_data_ip will
+	point to this instance
+
+START UP
+
+- Make sure both mgmt_interface (usually tun1) and data_interface (tun0)
+    are up.
+- Start cube-routed as root: # /usr/local/sbin/cube-routed /etc/cube1.conf
+    (root powers are required to adjust system routing tables)
+- cube-routed will write info and debug messages to syslog (log files
+    are usually located under /var/log)
+
+PORTABILITY
+
+cube-routed was tested and currently is running on Linux (specifically
+Debian Etch). It should work on all Linux flavors without changes. It depends
+on /bin/netstat and /sbin/route - if both of these have the same interface
+and output on your system as they do in Linux, you should be able to run
+cube-routed without changes.
+
+QUESTIONS / SUPPORT
+
+Please visit http://www.cohesiveft.com/developer/
+
+

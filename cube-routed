@@ -1,0 +1,429 @@
+#!/usr/bin/python
+#
+# cube-routed - dynamic routing daemon for Cube infrastructure (VcubeV)
+#
+#   The contents of this file are subject to the Common Public
+#   Attribution License Version 1.0 (the "License"); you may not use this
+#   file except in compliance with the License. You may obtain a copy of
+#   the License at http://www.developer.cohesiveft.com/licenses/CPAL. The
+#   License is based on the Mozilla Public License Version 1.1 but
+#   Sections 14 and 15 have been added to cover use of software over a
+#   computer network and provide for limited attribution for the Original
+#   Developer. In addition, Exhibit A has been modified to be consistent
+#   with Exhibit B.
+#   Software distributed under the License is distributed on an "AS IS"
+#   basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See
+#   the License for the specific language governing rights and limitations
+#   under the License.
+#   The Original Code is Cohesive Flexible Technologies LLC VcubeV.
+#   The Initial Developer of the Original Code is Cohesive Flexible
+#   Technologies LLC. All portions of the code written by Cohesive
+#   Flexible Technologies LLC are 2007 Copyright (c) Cohesive Flexible
+#   Technologies LLC. All Rights Reserved.
+#
+# Full text of CPAL is provided in this archive in LICENSE.txt file.
+#
+# Portions of this file are licensed under the modified BSD license:
+# Copyright (C) 2003-2007 Edgewall Software
+# 
+#
+# Technical overview:
+#
+# thread 1 - talks to remote cube-routed and builds a list of
+#				connected clients
+# thread 2 - adjusts routing table based on local and remote lists
+# thread 3 - talks to local openvpn and builds a list of connected clients
+# thread 4 - dumps runtime info to syslog at regular intervals
+# main thread - publishes a list of locally connected clients
+#				for remote cube-routed instances
+
+import sys, os, time
+import telnetlib
+import re
+import thread
+import SocketServer
+import socket
+import syslog
+
+#---------------------------------------------------------------------
+
+#################
+### daemonize() function
+### borrowed from Trac
+#
+#Trac is licensed under the modified BSD license.
+#
+#Copyright (C) 2003-2007 Edgewall Software
+#
+#Redistribution and use in source and binary forms, with or without
+#modification, are permitted provided that the following conditions
+#are met:
+#
+#1. Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in
+#   the documentation and/or other materials provided with the
+#   distribution.
+# 3. The name of the author may not be used to endorse or promote
+#   products derived from this software without specific prior
+#   written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE AUTHOR `AS IS'' AND ANY EXPRESS
+#  OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+#  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+#  ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+#  DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+#  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+#  GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+#  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+#  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+#  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+#  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#
+#
+#
+#
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2006 Edgewall Software
+# All rights reserved.
+#
+# This software is licensed as described in the file COPYING, which
+# you should have received as part of this distribution. The terms
+# are also available at http://trac.edgewall.org/wiki/TracLicense.
+#
+# This software consists of voluntary contributions made by many
+# individuals. For the exact contribution history, see the revision
+# history and logs, available at http://trac.edgewall.org/log/.
+
+import os
+import sys
+
+def daemonize(stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
+    """Fork a daemon process (taken from the Python Cookbook)."""
+
+    # Perform first fork
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0) # exit first parent
+
+    # Decouple from parent environment
+    os.chdir('/')
+    os.umask(0)
+    os.setsid()
+
+    # Perform second fork
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0) # exit first parent
+
+    # The process is now daemonized, redirect standard file descriptors
+    for fileobj in sys.stdout, sys.stderr:
+        fileobj.flush()
+    stdin = file(stdin, 'r')
+    stdout = file(stdout, 'a+')
+    stderr = file(stderr, 'a+', 0)
+    os.dup2(stdin.fileno(), sys.stdin.fileno())
+    os.dup2(stdout.fileno(), sys.stdout.fileno())
+    os.dup2(stderr.fileno(), sys.stderr.fileno())
+
+### end of daemonize() function
+#################
+
+#---------------------------------------------------------------------
+
+class OpenVPNMgmt:
+	" Run commands over OpenVPN management interface "
+	def __init__(self, host, port, password):
+		self.host = host
+		self.port = int(port)
+		self.password = password
+
+	def connect(self):
+		" Connect to openvpn mgmt interface "
+		try: self.close()
+		except: pass
+		if self.connected():
+			return True
+		self.tn = telnetlib.Telnet(self.host, self.port)
+		self.tn.read_until('ENTER PASSWORD:', 2)
+		self.tn.write(self.password + '\n')
+		self.tn.read_until('SUCCESS:', 2)
+		self._seek_to_eof()
+		return True
+
+	def _seek_to_eof(self):
+		" Read as much as available. Position seek pointer to end of stream "
+		b = self.tn.read_eager()
+		while b:
+			b = self.tn.read_eager()
+
+	def connected(self):
+		" Returns True if connected "
+		try:
+			assert self.tn
+			return True
+		except:
+			return False
+
+	def close(self):
+		" Close connection to openvpn management interface "
+		self.tn.write("quit\n")
+		self.tn.read_all()
+		self.tn.get_socket().close()
+		del self.tn
+
+	def _send_command(self, cmd):
+		" Send a command to openvpn and return response as list "
+		if not self.connected():
+			self.connect()
+		self.tn.write(cmd + "\n")
+		buf = self.tn.read_until("END", 2)
+		self._seek_to_eof()
+		blist = buf.split('\r\n')
+		if blist[-1].startswith('END'):
+			del blist[-1]
+			return blist
+		else:
+			return [ ]
+
+	def status(self):
+		" OpenVPN command: status "
+		return self._send_command("status")
+	def status2(self):
+		"OpenVPN command: status 2"
+		return self._send_command("status 2")
+
+	def get_clients(self):
+		" Get a list of connected clients based on status2 command "
+		client_list = [ ]
+		for l in self.status2():
+			if l.startswith('CLIENT_LIST'):
+				client_ip = l.split(',')[3]
+				if client_ip:
+					client_list.append(client_ip)
+		return client_list
+
+
+#---------------------------------------------------------------------
+
+
+def get_routes():
+	r = { }
+	try:
+		f = os.popen('/bin/netstat -nr')
+	except:
+		return r
+
+	for l in f:
+		parts = l.split()
+		# we are dealing only with Host routes over tunnel interfaces
+		# which go over management interface, with destination
+		# other than remote_mgmt_ip
+		if not parts[-1].startswith(mgmt_interface): continue
+		if parts[2] != '255.255.255.255': continue
+		if parts[1] != mgmt_gw: continue
+		if parts[0] == remote_mgmt_ip: continue
+		r[parts[0]] = parts
+
+	f.close()
+	return r
+
+def do_sbin_route(action, ip):
+	cmd = "/sbin/route %s -host %s gw %s dev %s" % \
+			(action, ip, mgmt_gw, mgmt_interface)
+	if os.system(cmd):
+		logger("do_sbin_route FAIL", action, ip, cmd)
+	else:
+		logger("do_sbin_route OK", action, ip, cmd)
+
+def adjust_routing_table():
+	while True:
+		try:
+			global rt
+			rt = get_routes()
+
+			if remote_data_ip not in rt:
+				do_sbin_route("add", remote_data_ip)
+
+			for r_ip in remote_clients:
+				if r_ip not in rt:
+					do_sbin_route("add", r_ip)
+
+			for l_ip in local_clients:
+				if l_ip in rt:
+					do_sbin_route("del", l_ip)
+
+		except Exception, e:
+			logger("Exception in adjust_routing_table():", e)
+		time.sleep(10)
+
+
+#---------------------------------------------------------------------
+
+class CubeRoutedRequestHandler(SocketServer.StreamRequestHandler):
+	def handle(self):
+		self.wfile.write('\n'.join([ 'L '+a for a in local_clients ]))
+		self.wfile.write('\n')
+		self.wfile.write('\n'.join([ 'R '+a for a in remote_clients ]))
+		self.wfile.write('\n')
+		self.wfile.write('\n'.join([ 'T '+' '.join(r) for r in rt.values() ]))
+		self.wfile.write('\n')
+
+class CubeRoutedServer(SocketServer.ThreadingTCPServer):
+	allow_reuse_address = True
+
+#---------------------------------------------------------------------
+
+def parse_config_file(filename):
+	" Parse config file and return dict "
+	d = { }
+	f = open(filename)
+	for l in f:
+		l = l.split('#')[0]
+		m = re.match('(\S+)\s*=\s*(\S+)', l)
+		if m:
+			try:
+				v = int(m.groups()[1])
+			except ValueError:
+				v = m.groups()[1]
+			d[m.groups()[0]] = v
+	f.close()
+	d.update(parse_ifconfig("mgmt", d['mgmt_interface']))
+	d.update(parse_ifconfig("data", d['data_interface']))
+	return d
+
+def parse_ifconfig(name, interface):
+	" Parse ifconfig output to determine local and gw addresses "
+	d = { }
+	p = os.popen('/sbin/ifconfig %s' % interface)
+	for l in p:
+		if l.find('inet addr') < 0: continue
+		d[name+'_ip'], d[name+'_gw'] = \
+			[ k.split(':')[1] for k in l.split()[1:3] ]
+		break
+	p.close()
+	assert len(d) == 2, "parse_ifconfig(%s): bad return value: %s" \
+								% (interface, str(d))
+	return d
+
+def openvpn_mgmt_poller():
+	""" Regularly poll local openvpn and populate global local_clients.
+	Runs in its own thread.
+	"""
+	global local_clients
+	while True:
+		try:
+			f = open(openvpn_mgmt_pass_file)
+			pw = f.readline().strip()
+			f.close()
+			om = OpenVPNMgmt(data_ip, openvpn_mgmt_port, pw)
+
+			while True:
+				local_clients = om.get_clients()
+				# logger('local_clients', local_clients)
+				time.sleep(10)
+		except Exception, e:
+			logger("Exception in openvpn_mgmt_poller():", e)
+			local_clients = [ ]
+		time.sleep(10)
+
+def remote_clients_poller():
+	""" Regularly poll remote cube-routed for a list of its connected
+	clients.
+	"""
+	global remote_clients
+	while True:
+		try:
+			sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+			sock.settimeout(5)
+			sock.connect((remote_mgmt_ip, cube_routed_port))
+			b = ''
+			while True:
+				c = sock.recv(1024)
+				if c == '': break
+				b += c
+			rcl = [ ]
+			for l in b.split('\n'):
+				if l.startswith('L '):
+					rcl.append(l.split()[1])
+			dups = set(local_clients) & set(rcl)
+			for d in dups:
+				logger("Dup client:", d)
+				# we will trust local list over remote list
+				# therefore, remove a dup entry from remote list
+				rcl.remove(d)
+			remote_clients = rcl
+			sock.close()
+		except Exception, e:
+			try: sock.close()
+			except: pass
+			remote_clients = [ ]
+			logger("Exception in remote_clients_poller():", e)
+		# logger('remote_clients', remote_clients)
+		time.sleep(10)
+
+#---------------------------------------------------------------------
+
+def runtime_dumper():
+	" Dump runtime info to log file once in a while "
+	while True:
+		try:
+			logger("local_clients", local_clients)
+			logger("remote_clients", remote_clients)
+			logger("routing_table", rt)
+		except Exception, e:
+			logger("Exception in runtime_logger():", e)
+		time.sleep(600)	# 10 minutes
+	
+#---------------------------------------------------------------------
+
+def logger(*args):
+	" logger function "
+	msg = ' '.join([str(a).strip() for a in args])
+	# print time.asctime(), msg
+	syslog.syslog(syslog.LOG_INFO | syslog.LOG_DAEMON, msg)
+
+#---------------------------------------------------------------------
+
+if __name__ == '__main__':
+	assert len(sys.argv) == 2, "Usage: cube-routed /path/to/config"
+	# will fail if data or mgmt interface does not exist
+	confdict = parse_config_file(sys.argv[1])
+
+	global local_clients, remote_clients, rt
+	local_clients = [ ]
+	remote_clients = [ ]
+	rt = { }		# routing table
+
+	daemonize()
+	syslog.openlog("cube-routed")
+
+	logger("cube-routed starting up")
+	logger("Configuration:", confdict)
+	globals().update(confdict)
+
+	# thread 1
+	thread.start_new_thread(remote_clients_poller,( ))
+
+	# thread 2
+	time.sleep(1)
+	thread.start_new_thread(adjust_routing_table,( ))
+
+	# thread 3
+	time.sleep(1)
+	thread.start_new_thread(openvpn_mgmt_poller,( ))
+
+	# thread 4
+	thread.start_new_thread(runtime_dumper,( ))
+
+	# main thread
+	data_publisher = CubeRoutedServer((mgmt_ip,cube_routed_port),
+					CubeRoutedRequestHandler)
+	data_publisher.serve_forever()
+
+
+
+
